@@ -51,7 +51,7 @@ const stopIcon = (n) => L.divIcon({
   iconSize: [24, 24], iconAnchor: [12, 12],
 });
 
-// ── Terrain overlay ────────────────────────────────────────────────────────────
+// only used for testing purposes to see the area. failed attempt at terrain overlay with leaflet
 // function TerrainOverlay({ topography }) {
 //   const map = useMap();
 //   useEffect(() => {
@@ -229,9 +229,9 @@ function MapView() {
           padding: "20px 20px 12px", borderBottom: `1px solid ${C.border}`
         }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-            <span style={{ fontSize: 20 }}>🚌</span>
+            <span style={{ fontSize: 20 }}></span>
             <span style={{ color: C.accent, fontWeight: 700, fontSize: 15, letterSpacing: "0.04em" }}>
-              BUS ROUTER
+              ECOROUTE
             </span>
           </div>
           <div style={{ color: C.muted, fontSize: 11 }}>Carbon-efficient school bus routing</div>
@@ -241,7 +241,7 @@ function MapView() {
 
           {/* School address */}
           <section>
-            <Label>🏫 School Address</Label>
+            <Label> School Address</Label>
             <div style={{ display: "flex", gap: 6 }}>
               <input
                 value={schoolInput}
