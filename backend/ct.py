@@ -1,23 +1,15 @@
-import rasterio #purely for testing the geotiff file, not used in the actual app.py code
-import numpy as np
-import matplotlib.pyplot as plt
+from geopy.geocoders import Nominatim
+import ssl
+import certifi
 
+# create SSL context with certifi root certificates
+ssl_context = ssl.create_default_context(cafile=certifi.where())
 
-tif_path = "avtif.tif"  
-with rasterio.open(tif_path) as src:
-    data = src.read(1)  
+# initialize geolocator
+geolocator = Nominatim(
+    user_agent="my_app",
+    adapter_factory=lambda **kwargs: Nominatim._DEFAULT_ADAPTER_CLASS(ssl_context=ssl_context)
+)
 
-print("Shape (rows x cols):", data.shape)
-print("Min elevation:", np.min(data))
-print("Max elevation:", np.max(data))
-
-#show table
-print("Sample of elevation data (top-left 10x10):")
-print(data[:10, :10])
-
-#show img
-plt.figure(figsize=(8, 6))
-plt.imshow(data, cmap='terrain')  
-plt.colorbar(label='Elevation')
-plt.title("GeoTIFF Topography Preview")
-plt.show()
+location = geolocator.geocode("401 Avery Co High School Rd")
+print(location.latitude, location.longitude)

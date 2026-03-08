@@ -1,4 +1,4 @@
-import osmnx as ox
+import osmnx as ox #we use this for testing only
 
 print("starting")
 place = "Avery County, North Carolina, USA"
@@ -6,7 +6,6 @@ G = ox.graph_from_place(place, network_type="drive")
 G = ox.project_graph(G)
 G = ox.add_edge_speeds(G)
 
-# Count edges with and without speed_kph
 edges_with_speed = 0
 edges_without_speed = 0
 
