@@ -19,7 +19,7 @@ function App() {
   const fileRef = useRef();
   const [showFastest, setShowFastest] = useState(false);
   const [animatingBus, setAnimatingBus] = useState(null);
-  
+
   const handleGeocodeSchool = async () => {
     console.log("---- Geocode School Triggered ----");
     if (!schoolInput.trim()) return;
@@ -136,6 +136,7 @@ function App() {
         addingStops={addingStops}
         onAddStop={handleAddStop}
         result={result}
+        showFastest={showFastest}
         selectedBus={selectedBus}
         onSelectBus={setSelectedBus}
         animatingBus={animatingBus}
@@ -164,6 +165,8 @@ function App() {
           onSelectBus={setSelectedBus}
           error={error}
           onAnimateBus={setAnimatingBus}
+          showFastest={showFastest}
+          onShowFastestChange={setShowFastest}
         />
       </div>
     </div>

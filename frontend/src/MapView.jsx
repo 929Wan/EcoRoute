@@ -66,7 +66,6 @@ const busIcon = (color) => L.divIcon({
   iconSize: [28, 28], iconAnchor: [14, 14],
 });
 
-// ── Terrain overlay ───────────────────────────────────────────────────────────
 function TerrainOverlay({ topography }) {
   const map = useMap();
   useEffect(() => {
@@ -196,9 +195,7 @@ function CountyBoundary() {
   useEffect(() => {
     let layer = null;
 
-    fetch(
-      "https://nominatim.openstreetmap.org/search?q=Avery+County%2C+North+Carolina%2C+USA&format=json&polygon_geojson=1&limit=1"
-    )
+    fetch("http://10.180.0.161:6001/county-boundary")
       .then(r => r.json())
       .then(data => {
         if (!data?.[0]?.geojson) return;
