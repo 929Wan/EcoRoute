@@ -1,15 +1,12 @@
-from geopy.geocoders import Nominatim
-import ssl
-import certifi
+import osmnx as ox
 
-# create SSL context with certifi root certificates
-ssl_context = ssl.create_default_context(cafile=certifi.where())
+print("starting")
+place = "Avery County, North Carolina, USA"
+G = ox.graph_from_place(place, network_type="drive")
+G = ox.project_graph(G)
+G = ox.add_edge_speeds(G)
 
-# initialize geolocator
-geolocator = Nominatim(
-    user_agent="my_app",
-    adapter_factory=lambda **kwargs: Nominatim._DEFAULT_ADAPTER_CLASS(ssl_context=ssl_context)
-)
-
-location = geolocator.geocode("401 Avery Co High School Rd")
-print(location.latitude, location.longitude)
+print("Sample edges with speed data:")
+# Print a sample of edges with their speed values
+for u, v, data in list(G.edges(data=True))[:100]:
+    print(data.get("highway"), "→", data.get("speed_kph"), "kph")

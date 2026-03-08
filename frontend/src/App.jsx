@@ -5,7 +5,6 @@ import { useState, useEffect, useRef, useCallback } from "react";
 const API = "http://10.180.0.161:6001";
 
 function App() {
-  // Shared state
   const [school, setSchool] = useState(null);
   const [schoolInput, setSchoolInput] = useState("");
   const [stops, setStops] = useState([]);

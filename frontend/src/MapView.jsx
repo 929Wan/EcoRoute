@@ -94,7 +94,6 @@ function TerrainOverlay({ topography }) {
   return null;
 }
 
-// ── Click handler ─────────────────────────────────────────────────────────────
 function ClickHandler({ addingStops, onAddStop }) {
   useMapEvents({
     click(e) {
@@ -104,7 +103,6 @@ function ClickHandler({ addingStops, onAddStop }) {
   return null;
 }
 
-// ── Animated bus marker ───────────────────────────────────────────────────────
 function AnimatedBus({ coords, color }) {
   const map = useMap();
   const stateRef = useRef({ cancelled: false, marker: null, raf: null });
@@ -112,7 +110,6 @@ function AnimatedBus({ coords, color }) {
   useEffect(() => {
     if (!coords || coords.length < 2) return;
 
-    // Cancel any previous animation cleanly
     const state = { cancelled: false, marker: null, raf: null };
     stateRef.current = state;
 
@@ -123,7 +120,6 @@ function AnimatedBus({ coords, color }) {
     }).addTo(map);
     state.marker = marker;
 
-    // Pre-compute cumulative distances
     const dists = [0];
     for (let i = 1; i < coords.length; i++) {
       const dlat = coords[i].lat - coords[i - 1].lat;
@@ -132,7 +128,6 @@ function AnimatedBus({ coords, color }) {
     }
     const totalDist = dists[dists.length - 1];
 
-    // Scale duration to actual route length — 80000ms per degree of total distance
     const DURATION = Math.max(6000, Math.min(30000, totalDist * 80000));
 
     const startTime = performance.now();
@@ -144,7 +139,6 @@ function AnimatedBus({ coords, color }) {
       const t = Math.min(elapsed / DURATION, 1);
       const target = t * totalDist;
 
-      // Binary search for current segment
       let lo = 0, hi = dists.length - 1;
       while (lo < hi - 1) {
         const mid = (lo + hi) >> 1;
@@ -175,7 +169,6 @@ function AnimatedBus({ coords, color }) {
   return null;
 }
 
-// ── Legend row ────────────────────────────────────────────────────────────────
 function LegendRow({ color, label, dashed }) {
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -219,7 +212,7 @@ function CountyBoundary() {
   return null;
 }
 
-// ── Main map view ─────────────────────────────────────────────────────────────
+// main map
 function MapView({
   school,
   stops,
@@ -278,21 +271,18 @@ function MapView({
         <CountyBoundary />
         <ClickHandler addingStops={addingStops} onAddStop={onAddStop} />
 
-        {/* School marker */}
         {school && (
           <Marker position={[school.lat, school.lon]} icon={schoolIcon}>
             <Popup>🏫 School</Popup>
           </Marker>
         )}
 
-        {/* Stop markers */}
         {stops.map((s, i) => (
           <Marker key={i} position={[s.lat, s.lon]} icon={stopIcon(i + 1)}>
             <Popup>{s.label}<br />{s.lat.toFixed(5)}, {s.lon.toFixed(5)}</Popup>
           </Marker>
         ))}
 
-        {/* Bus polylines */}
         {result && result.buses && result.buses.map((bus, i) => {
           const color = BUS_COLORS[i % BUS_COLORS.length];
           const isSelected = selectedBus === bus.bus_id;
@@ -316,7 +306,6 @@ function MapView({
           );
         })}
 
-        {/* Animated bus */}
         {animatingBus && (
           <AnimatedBus
             key={animatingBus.key}
@@ -326,7 +315,6 @@ function MapView({
         )}
       </MapContainer>
 
-      {/* Legend */}
       {result && (
         <div style={{
           position: "absolute", bottom: 20, right: 20, zIndex: 999,
@@ -344,7 +332,6 @@ function MapView({
         </div>
       )}
 
-      {/* Adding stops hint */}
       {addingStops && (
         <div style={{
           position: "absolute", top: 16, left: "50%", transform: "translateX(-50%)", zIndex: 999,
@@ -357,7 +344,6 @@ function MapView({
         </div>
       )}
 
-      {/* Click route hint */}
       {result && !animatingBus && (
         <div style={{
           position: "absolute", bottom: 20, left: "50%", transform: "translateX(-50%)", zIndex: 999,

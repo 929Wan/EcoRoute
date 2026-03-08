@@ -31,7 +31,7 @@ def handle_options():
         res.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         return res
 
-# ── Region & Graph ────────────────────────────────────────────────────────────
+#graph of location
 place = "Avery County, North Carolina, USA"
 print("Loading OSM graph...")
 G = ox.graph_from_place(place, network_type="drive")
@@ -55,7 +55,7 @@ print("Caching unprojected graph...")
 G_unproj = ox.project_graph(G_proj, to_crs="EPSG:4326")
 print("Done.")
 
-# ── DEM ───────────────────────────────────────────────────────────────────────
+#topography data
 DEM_PATH = "avtif.tif"
 
 def sample_edge_elevation(geom):
@@ -86,7 +86,7 @@ def get_elevation_batch(coords):
                 elevations.append(0.0)
     return elevations
 
-# ── Constants ─────────────────────────────────────────────────────────────────
+#constants
 BASE_EMISSION_RATE = 1.2
 STUDENT_MASS_KG    = 70
 BUS_EMPTY_MASS_KG  = 11_000
@@ -94,7 +94,7 @@ IDLE_EMISSION_KG_S = 0.001
 IDLE_TIME_S        = 30
 MAX_BUS_CAPACITY   = 54
 MAX_ROUTE_MIN      = 70
-TARGET_STOPS_PER_BUS = 20  # target max stops per bus for scaling
+TARGET_STOPS_PER_BUS = 20  
 
 ROAD_FUEL_FACTOR = {
     "motorway":     0.86,
@@ -124,7 +124,7 @@ def carbon_cost_edge(u, v, edge_data, num_students, elev_u, elev_v):
         elevs = sample_edge_elevation(geom)
         total_ascent  = sum(max(0, elevs[i+1] - elevs[i]) for i in range(len(elevs)-1))
         total_descent = sum(max(0, elevs[i] - elevs[i+1]) for i in range(len(elevs)-1))
-        net = (total_ascent * 4.0) - (total_descent * 1.2)
+        net = (total_ascent * 2.7) - (total_descent * 1.2)
         grade_factor = 1.0 + max(-0.15, min(0.60, net / length_m))
     elif length_m > 0:
         grade = (elev_v - elev_u) / length_m
@@ -144,14 +144,14 @@ def travel_time_edge(edge_data):
     speed_kph = edge_data.get("speed_kph", 40.0)
     return (length_m / 1000.0) / speed_kph * 3600.0
 
-# ── Pre-compute elevations ────────────────────────────────────────────────────
+
 print("Pre-computing node elevations...")
 node_ids    = list(G_proj.nodes())
 node_coords = [(G_proj.nodes[n]["y"], G_proj.nodes[n]["x"]) for n in node_ids]
 NODE_ELEV   = dict(zip(node_ids, get_elevation_batch(node_coords)))
 print("Elevations cached.")
 
-# ── Weighted graph ────────────────────────────────────────────────────────────
+
 def build_carbon_graph(num_students):
     H = G_proj.copy()
     for u, v, key, data in G_proj.edges(keys=True, data=True):
@@ -161,14 +161,12 @@ def build_carbon_graph(num_students):
         H[u][v][key]["time_weight"]   = travel_time_edge(data)
     return H
 
-# ── Nearest node ──────────────────────────────────────────────────────────────
 def nearest_node(lat, lon):
     crs = G_proj.graph["crs"]
     transformer = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
     x, y = transformer.transform(lon, lat)
     return ox.distance.nearest_nodes(G_proj, x, y)
 
-# ── Snap to walkable intersection ─────────────────────────────────────────────
 def snap_to_walkable_intersection(lat, lon, min_degree=3, max_walk_m=800):
     start_node = nearest_node(lat, lon)
     if G_proj.degree(start_node) >= min_degree:
@@ -196,7 +194,7 @@ def snap_to_walkable_intersection(lat, lon, min_degree=3, max_walk_m=800):
             queue.append((new_dist, neighbor))
     return lat, lon
 
-# ── Greedy TSP with 2-opt ─────────────────────────────────────────────────────
+#greedy algorithm
 def greedy_route(H, school_node, stop_nodes, weight_key):
     if not stop_nodes:
         return [school_node], 0.0
@@ -251,7 +249,6 @@ def greedy_route(H, school_node, stop_nodes, weight_key):
 
     return full_path, total_w
 
-# ── Path → coords ─────────────────────────────────────────────────────────────
 def path_to_coords(path):
     coords = []
     for i in range(len(path) - 1):
@@ -287,7 +284,6 @@ def compute_path_stats(path, num_students):
         "time_min":    round(total_time / 60, 1),
     }
 
-# ── Clustering helpers ────────────────────────────────────────────────────────
 def kmeans_clustering(stop_coords, n_buses, seed=42):
     coords_arr = np.array([[c[0], c[1]] for c in stop_coords])
     km  = KMeans(n_clusters=n_buses, n_init=10, random_state=seed)
@@ -325,7 +321,6 @@ def quadrant_clusters(stop_coords, n_buses):
         clusters = [clusters[0] + clusters[1]] + clusters[2:]
     return clusters
 
-# ── VRP evaluator ─────────────────────────────────────────────────────────────
 def evaluate_clustering(clustering, school_node, stop_nodes,
                         stop_coords, num_students, H, enforce_cap):
     n_stops = len(stop_nodes)
@@ -368,13 +363,11 @@ def build_result(buses, total_carbon):
         "carbon_saved_pct": saved_pct,
     }
 
-# ── VRP solver ────────────────────────────────────────────────────────────────
 def solve_vrp(school_node, stop_nodes, stop_coords, num_students, H):
     n_stops = len(stop_nodes)
     if n_stops == 0:
         return {"buses": [], "num_buses": 0, "total_carbon_kg": 0.0}
 
-    # Scale minimum buses based on both student capacity AND stop density
     min_buses_capacity = math.ceil(num_students / MAX_BUS_CAPACITY)
     min_buses_density  = math.ceil(n_stops / TARGET_STOPS_PER_BUS)
     min_buses = max(min_buses_capacity, min_buses_density)
@@ -427,7 +420,6 @@ def solve_vrp(school_node, stop_nodes, stop_coords, num_students, H):
                 best_carbon = total_carbon
                 best_result = build_result(buses, total_carbon)
 
-        # Only stop early if routes are short AND stops per bus is reasonable
         if best_result is not None:
             worst_time = max(
                 max(b["carbon_route"]["stats"]["time_min"],
@@ -439,7 +431,6 @@ def solve_vrp(school_node, stop_nodes, stop_coords, num_students, H):
                 print(f"  Early stop at {n_buses} buses (worst={worst_time:.0f}min, max_stops={max_stops_on_bus})")
                 break
 
-    # Fallback: relax time cap
     if best_result is None:
         print("Warning: time cap could not be met, relaxing constraint")
         best_carbon = math.inf
@@ -460,7 +451,6 @@ def solve_vrp(school_node, stop_nodes, stop_coords, num_students, H):
 
     return best_result
 
-# ── Geocoding ─────────────────────────────────────────────────────────────────
 ssl_ctx = ssl.create_default_context(cafile=certifi.where())
 
 geolocator      = Nominatim(user_agent="bus_router", timeout=10)
@@ -472,11 +462,11 @@ def geocode_address(address):
         return loc.latitude, loc.longitude
     return None
 
-# ── County boundary ───────────────────────────────────────────────────────────
+#bounds
 print("Fetching county boundary...")
 _COUNTY_BOUNDARY = None
 try:
-    time.sleep(8)  # wait for Nominatim rate limiter to recover after graph load
+    time.sleep(8)  
     url = "https://nominatim.openstreetmap.org/search?q=Avery+County%2C+North+Carolina%2C+USA&format=json&polygon_geojson=1&limit=1"
     req = urllib.request.Request(url, headers={"User-Agent": "ecoroute_boundary_fetcher/1.0"})
     ctx = ssl.create_default_context(cafile=certifi.where())
@@ -489,7 +479,7 @@ except Exception as e:
     print(f"County boundary fetch failed: {type(e).__name__}: {e}")
     _COUNTY_BOUNDARY = None
 
-# ── Flask routes ──────────────────────────────────────────────────────────────
+
 
 @app.route("/nodes")
 def get_nodes():
