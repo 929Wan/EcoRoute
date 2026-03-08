@@ -2,11 +2,10 @@ import {
   MapContainer, TileLayer, Marker, Popup,
   ZoomControl, useMap, Polyline, useMapEvents
 } from "react-leaflet";
-import { useEffect, useState, useRef, useCallback } from "react";
+import { useEffect, useState, useRef } from "react";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 
-// ── Palette & style ───────────────────────────────────────────────────────────
 const C = {
   bg:       "#0d1117",
   surface:  "#161b22",
@@ -20,9 +19,14 @@ const C = {
   panel:    "rgba(13,17,23,0.93)",
 };
 
+const BUS_COLORS = [
+  "#3fb950", "#58a6ff", "#f78166", "#d29922",
+  "#bc8cff", "#39d353", "#ff7b72", "#79c0ff",
+  "#56d364", "#ffa657"
+];
+
 const fontStack = `'IBM Plex Mono', 'Fira Code', monospace`;
 
-// Fix default leaflet marker icons
 delete L.Icon.Default.prototype._getIconUrl;
 L.Icon.Default.mergeOptions({
   iconRetinaUrl: "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-icon-2x.png",
@@ -51,39 +55,47 @@ const stopIcon = (n) => L.divIcon({
   iconSize: [24, 24], iconAnchor: [12, 12],
 });
 
-// only used for testing purposes to see the area. failed attempt at terrain overlay with leaflet
-// function TerrainOverlay({ topography }) {
-//   const map = useMap();
-//   useEffect(() => {
-//     if (!topography) return;
-//     const canvas = document.createElement("canvas");
-//     const { elevations, bounds } = topography;
-//     const rows = elevations.length, cols = elevations[0].length;
-//     canvas.width = cols; canvas.height = rows;
-//     const ctx = canvas.getContext("2d");
-//     const flat = elevations.flat();
-//     const min = Math.min(...flat), max = Math.max(...flat);
-//     for (let y = 0; y < rows; y++) {
-//       for (let x = 0; x < cols; x++) {
-//         const v = (elevations[y][x] - min) / (max - min);
-//         const r = Math.floor(v * 80 + 20);
-//         const g = Math.floor(v * 100 + 30);
-//         const b = Math.floor(v * 60 + 10);
-//         ctx.fillStyle = `rgba(${r},${g},${b},0.1)`;
-//         ctx.fillRect(x, y, 1, 1);
-//       }
-//     }
-//     const overlay = L.imageOverlay(
-//       canvas.toDataURL(),
-//       [[bounds.bottom, bounds.left], [bounds.top, bounds.right]],
-//       { opacity: 0.6 }
-//     ).addTo(map);
-//     return () => map.removeLayer(overlay);
-//   }, [topography, map]);
-//   return null;
-// }
+const busIcon = (color) => L.divIcon({
+  className: "",
+  html: `<div style="
+    width:28px;height:28px;border-radius:50%;
+    background:${color};border:2px solid white;
+    display:flex;align-items:center;justify-content:center;
+    font-size:16px;box-shadow:0 0 8px ${color}88;
+    z-index:9999;">🚌</div>`,
+  iconSize: [28, 28], iconAnchor: [14, 14],
+});
 
-// ── Click handler to add stops ─────────────────────────────────────────────────
+// ── Terrain overlay ───────────────────────────────────────────────────────────
+function TerrainOverlay({ topography }) {
+  const map = useMap();
+  useEffect(() => {
+    if (!topography) return;
+    const canvas = document.createElement("canvas");
+    const { elevations, bounds } = topography;
+    const rows = elevations.length, cols = elevations[0].length;
+    canvas.width = cols; canvas.height = rows;
+    const ctx = canvas.getContext("2d");
+    const flat = elevations.flat();
+    const min = Math.min(...flat), max = Math.max(...flat);
+    for (let y = 0; y < rows; y++) {
+      for (let x = 0; x < cols; x++) {
+        const v = (elevations[y][x] - min) / (max - min);
+        ctx.fillStyle = `rgba(0,0,0,${(1 - v) * 0.0})`;
+        ctx.fillRect(x, y, 1, 1);
+      }
+    }
+    const overlay = L.imageOverlay(
+      canvas.toDataURL(),
+      [[bounds.bottom, bounds.left], [bounds.top, bounds.right]],
+      { opacity: 1 }
+    ).addTo(map);
+    return () => map.removeLayer(overlay);
+  }, [topography, map]);
+  return null;
+}
+
+// ── Click handler ─────────────────────────────────────────────────────────────
 function ClickHandler({ addingStops, onAddStop }) {
   useMapEvents({
     click(e) {
@@ -93,112 +105,147 @@ function ClickHandler({ addingStops, onAddStop }) {
   return null;
 }
 
-// ── Stat card ─────────────────────────────────────────────────────────────────
-function StatCard({ label, value, unit, highlight }) {
+// ── Animated bus marker ───────────────────────────────────────────────────────
+function AnimatedBus({ coords, color }) {
+  const map = useMap();
+  const stateRef = useRef({ cancelled: false, marker: null, raf: null });
+
+  useEffect(() => {
+    if (!coords || coords.length < 2) return;
+
+    // Cancel any previous animation cleanly
+    const state = { cancelled: false, marker: null, raf: null };
+    stateRef.current = state;
+
+    const icon = busIcon(color);
+    const marker = L.marker([coords[0].lat, coords[0].lon], {
+      icon,
+      zIndexOffset: 9000,
+    }).addTo(map);
+    state.marker = marker;
+
+    // Pre-compute cumulative distances
+    const dists = [0];
+    for (let i = 1; i < coords.length; i++) {
+      const dlat = coords[i].lat - coords[i - 1].lat;
+      const dlon = coords[i].lon - coords[i - 1].lon;
+      dists.push(dists[i - 1] + Math.sqrt(dlat * dlat + dlon * dlon));
+    }
+    const totalDist = dists[dists.length - 1];
+
+    // Scale duration to actual route length — 80000ms per degree of total distance
+    const DURATION = Math.max(6000, Math.min(30000, totalDist * 80000));
+
+    const startTime = performance.now();
+
+    function animate(now) {
+      if (state.cancelled) return;
+
+      const elapsed = now - startTime;
+      const t = Math.min(elapsed / DURATION, 1);
+      const target = t * totalDist;
+
+      // Binary search for current segment
+      let lo = 0, hi = dists.length - 1;
+      while (lo < hi - 1) {
+        const mid = (lo + hi) >> 1;
+        if (dists[mid] <= target) lo = mid; else hi = mid;
+      }
+
+      const segLen = dists[hi] - dists[lo];
+      const segT = segLen > 0 ? (target - dists[lo]) / segLen : 0;
+      const lat = coords[lo].lat + segT * (coords[hi].lat - coords[lo].lat);
+      const lon = coords[lo].lon + segT * (coords[hi].lon - coords[lo].lon);
+
+      marker.setLatLng([lat, lon]);
+
+      if (t < 1) {
+        state.raf = requestAnimationFrame(animate);
+      }
+    }
+
+    state.raf = requestAnimationFrame(animate);
+
+    return () => {
+      state.cancelled = true;
+      if (state.raf) cancelAnimationFrame(state.raf);
+      if (state.marker) map.removeLayer(state.marker);
+    };
+  }, [coords, color, map]);
+
+  return null;
+}
+
+// ── Legend row ────────────────────────────────────────────────────────────────
+function LegendRow({ color, label, dashed }) {
   return (
-    <div style={{
-      background: highlight ? "rgba(63,185,80,0.08)" : "rgba(255,255,255,0.03)",
-      border: `1px solid ${highlight ? C.accentDim : C.border}`,
-      borderRadius: 6, padding: "8px 12px", flex: 1, minWidth: 80
-    }}>
-      <div style={{ color: C.muted, fontSize: 10, letterSpacing: "0.08em", textTransform: "uppercase" }}>{label}</div>
-      <div style={{ color: highlight ? C.accent : C.text, fontSize: 18, fontWeight: 700, lineHeight: 1.3 }}>
-        {value}<span style={{ fontSize: 11, color: C.muted, marginLeft: 3 }}>{unit}</span>
-      </div>
+    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+      <div style={{
+        width: 28, height: 3,
+        background: dashed ? "none" : color,
+        borderTop: dashed ? `2px dashed ${color}` : "none",
+      }} />
+      <span style={{ color: "#8b949e", fontSize: 11 }}>{label}</span>
     </div>
   );
 }
 
-// ── Main map view ──────────────────────────────────────────────────────────────
-function MapView() {
-  const [topography,   setTopography]   = useState(null);
-  const [school,       setSchool]       = useState(null);  // {lat, lon}
-  const [schoolInput,  setSchoolInput]  = useState("");
-  const [stops,        setStops]        = useState([]);    // [{lat,lon,label}]
-  const [numStudents,  setNumStudents]  = useState(20);
-  const [addingStops,  setAddingStops]  = useState(false);
-  const [csvError,     setCsvError]     = useState("");
-  const [loading,      setLoading]      = useState(false);
-  const [result,       setResult]       = useState(null);  // route result
-  const [showFastest,  setShowFastest]  = useState(false);
-  const [error,        setError]        = useState("");
-  const fileRef = useRef();
+function CountyBoundary() {
+  const map = useMap();
 
+  useEffect(() => {
+    let layer = null;
+
+    fetch(
+      "https://nominatim.openstreetmap.org/search?q=Avery+County%2C+North+Carolina%2C+USA&format=json&polygon_geojson=1&limit=1"
+    )
+      .then(r => r.json())
+      .then(data => {
+        if (!data?.[0]?.geojson) return;
+        layer = L.geoJSON(data[0].geojson, {
+          style: {
+            color: "#3fb950",
+            weight: 2.5,
+            opacity: 0.9,
+            fillColor: "#3fb950",
+            fillOpacity: 0.04,
+          }
+        }).addTo(map);
+      })
+      .catch(err => console.error("County boundary fetch failed:", err));
+
+    return () => {
+      if (layer) map.removeLayer(layer);
+    };
+  }, [map]);
+
+  return null;
+}
+
+// ── Main map view ─────────────────────────────────────────────────────────────
+function MapView({
+  school,
+  stops,
+  addingStops,
+  onAddStop,
+  result,
+  showFastest,
+  selectedBus,
+  onSelectBus,
+  animatingBus,
+  onAnimateBus
+}) {
+  const [topography, setTopography] = useState(null);
 
   useEffect(() => {
     fetch(`http://10.180.0.161:6001/topography`).then(r => r.json()).then(setTopography);
   }, []);
 
+
   const center = topography
     ? [(topography.bounds.top + topography.bounds.bottom) / 2,
        (topography.bounds.left + topography.bounds.right) / 2]
     : [36.08, -81.9];
-
-  // ── Geocode school ────────────────────────────────────────────────────────
-  const handleGeocodeSchool = async () => {
-    if (!schoolInput.trim()) return;
-    setError("");
-    try {
-      const res  = await fetch(`${API}/geocode?address=${encodeURIComponent(schoolInput)}`);
-      const data = await res.json();
-      if (data.error) { setError("Address not found."); return; }
-      setSchool({ lat: data.lat, lon: data.lon });
-    } catch {
-      setError("Could not reach server.");
-    }
-  };
-
-  // ── Add stop from map click ────────────────────────────────────────────────
-  const handleAddStop = useCallback((lat, lon) => {
-    setStops(prev => [...prev, { lat, lon, label: `Stop ${prev.length + 1}` }]);
-  }, []);
-
-  const removeStop = (i) => setStops(prev => prev.filter((_, idx) => idx !== i));
-
-  // ── CSV upload ────────────────────────────────────────────────────────────
-  const handleCsv = (e) => {
-    setCsvError("");
-    const file = e.target.files[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (ev) => {
-      const lines = ev.target.result.trim().split("\n");
-      const parsed = [];
-      lines.forEach((line, i) => {
-        const cols = line.split(",");
-        if (cols.length < 2) return;
-        const lat = parseFloat(cols[0]), lon = parseFloat(cols[1]);
-        if (isNaN(lat) || isNaN(lon)) {
-          setCsvError(`Row ${i + 1}: invalid coords`);
-          return;
-        }
-        parsed.push({ lat, lon, label: cols[2]?.trim() || `Stop ${stops.length + i + 1}` });
-      });
-      setStops(prev => [...prev, ...parsed]);
-    };
-    reader.readAsText(file);
-    e.target.value = "";
-  };
-
-  // ── Compute routes ────────────────────────────────────────────────────────
-  const handleCompute = async () => {
-    if (!school) { setError("Please set the school location first."); return; }
-    if (stops.length === 0) { setError("Add at least one student stop."); return; }
-    setError(""); setLoading(true); setResult(null);
-    try {
-      const res  = await fetch(`${API}/route`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ school, stops, num_students: numStudents }),
-      });
-      const data = await res.json();
-      setResult(data);
-    } catch {
-      setError("Routing failed. Check the server.");
-    } finally {
-      setLoading(false);
-    }
-  };
 
   if (!topography) return (
     <div style={{
@@ -211,320 +258,120 @@ function MapView() {
     </div>
   );
 
-  const displayRoute = result
-    ? (showFastest ? result.fastest_route : result.carbon_route)
-    : null;
+  const handlePolylineClick = (bus, color) => {
+  onSelectBus(bus.bus_id);
+  const coords = showFastest ? bus.fastest_route.coords : bus.carbon_route.coords;
+  onAnimateBus({ coords, color, key: Date.now() });
+  };
+
 
   return (
-    <div style={{ height: "100vh", width: "100vw", display: "flex", background: C.bg, fontFamily: fontStack }}>
+    <div style={{ height: "100vh", width: "100vw", position: "relative", background: C.bg, fontFamily: fontStack }}>
+      <MapContainer
+        center={center} zoom={11} minZoom={9} maxZoom={16}
+        style={{ height: "100%", width: "100%" }}
+        zoomControl={false}
+      >
+        <TileLayer
+          attribution="© OpenStreetMap contributors"
+          url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}"
+        />
+        <ZoomControl position="topright" />
+        <TerrainOverlay topography={topography} />
+        <CountyBoundary />
+        <ClickHandler addingStops={addingStops} onAddStop={onAddStop} />
 
-      {/* ── Sidebar ──────────────────────────────────────────────────── */}
-      <div style={{
-        width: 320, minWidth: 320, height: "100vh", overflowY: "auto",
-        background: C.surface, borderRight: `1px solid ${C.border}`,
-        display: "flex", flexDirection: "column", zIndex: 1000
-      }}>
-        {/* Header */}
-        <div style={{
-          padding: "20px 20px 12px", borderBottom: `1px solid ${C.border}`
-        }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-            <span style={{ fontSize: 20 }}></span>
-            <span style={{ color: C.accent, fontWeight: 700, fontSize: 15, letterSpacing: "0.04em" }}>
-              ECOROUTE
-            </span>
-          </div>
-          <div style={{ color: C.muted, fontSize: 11 }}>Carbon-efficient school bus routing</div>
-        </div>
+        {/* School marker */}
+        {school && (
+          <Marker position={[school.lat, school.lon]} icon={schoolIcon}>
+            <Popup>🏫 School</Popup>
+          </Marker>
+        )}
 
-        <div style={{ padding: "16px 16px 0", flex: 1, display: "flex", flexDirection: "column", gap: 16 }}>
+        {/* Stop markers */}
+        {stops.map((s, i) => (
+          <Marker key={i} position={[s.lat, s.lon]} icon={stopIcon(i + 1)}>
+            <Popup>{s.label}<br />{s.lat.toFixed(5)}, {s.lon.toFixed(5)}</Popup>
+          </Marker>
+        ))}
 
-          {/* School address */}
-          <section>
-            <Label> School Address</Label>
-            <div style={{ display: "flex", gap: 6 }}>
-              <input
-                value={schoolInput}
-                onChange={e => setSchoolInput(e.target.value)}
-                onKeyDown={e => e.key === "Enter" && handleGeocodeSchool()}
-                placeholder="e.g. Avery County High School"
-                style={inputStyle}
-              />
-              <button onClick={handleGeocodeSchool} style={btnSmall}>Set</button>
-            </div>
-            {school && (
-              <div style={{ color: C.accent, fontSize: 11, marginTop: 4 }}>
-                ✓ {school.lat.toFixed(5)}, {school.lon.toFixed(5)}
-              </div>
-            )}
-          </section>
+        {/* Bus polylines */}
+        {result && result.buses && result.buses.map((bus, i) => {
+          const color = BUS_COLORS[i % BUS_COLORS.length];
+          const isSelected = selectedBus === bus.bus_id;
+          const carbonCoords = bus.carbon_route.coords;
+          const fastestCoords = bus.fastest_route.coords;
+          const activeCoords = showFastest ? fastestCoords : carbonCoords;
 
-          {/* Student count */}
-          <section>
-            <Label>👥 Students on Bus</Label>
-            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <input
-                type="range" min={1} max={50} value={numStudents}
-                onChange={e => setNumStudents(parseInt(e.target.value))}
-                style={{ flex: 1, accentColor: C.accent }}
-              />
-              <span style={{ color: C.text, fontSize: 14, fontWeight: 700, width: 28 }}>{numStudents}</span>
-            </div>
-          </section>
+          return (
+            <Polyline
+              key={`${bus.bus_id}-${showFastest}`}
+              positions={activeCoords.map(c => [c.lat, c.lon])}
+              eventHandlers={{
+                click: () => handlePolylineClick(bus, color)
+              }}
+              pathOptions={{
+                color,
+                weight: isSelected ? 6 : 4,
+                opacity: isSelected ? 1.0 : 0.75,
+              }}
+            />
+          );
+        })}
 
-          {/* Stops */}
-          <section>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
-              <Label>📍 Student Stops</Label>
-              <div style={{ display: "flex", gap: 6 }}>
-                <button
-                  onClick={() => setAddingStops(v => !v)}
-                  style={{
-                    ...btnSmall,
-                    background: addingStops ? C.accent : C.border,
-                    color: addingStops ? C.bg : C.text,
-                  }}
-                >
-                  {addingStops ? "✓ Click map" : "+ Map"}
-                </button>
-                <button onClick={() => fileRef.current.click()} style={btnSmall}>CSV</button>
-                <input ref={fileRef} type="file" accept=".csv" onChange={handleCsv} style={{ display: "none" }} />
-              </div>
-            </div>
-            {csvError && <div style={{ color: C.danger, fontSize: 11, marginBottom: 4 }}>{csvError}</div>}
-            {addingStops && (
-              <div style={{
-                background: "rgba(63,185,80,0.08)", border: `1px solid ${C.accentDim}`,
-                borderRadius: 6, padding: "6px 10px", fontSize: 11, color: C.accent, marginBottom: 6
-              }}>
-                Click anywhere on the map to add stops
-              </div>
-            )}
-            <div style={{ display: "flex", flexDirection: "column", gap: 4, maxHeight: 180, overflowY: "auto" }}>
-              {stops.length === 0 && (
-                <div style={{ color: C.muted, fontSize: 12 }}>No stops added yet.</div>
-              )}
-              {stops.map((s, i) => (
-                <div key={i} style={{
-                  display: "flex", justifyContent: "space-between", alignItems: "center",
-                  background: "rgba(255,255,255,0.03)", border: `1px solid ${C.border}`,
-                  borderRadius: 5, padding: "5px 10px"
-                }}>
-                  <span style={{ color: C.text, fontSize: 12 }}>
-                    <span style={{ color: C.accent }}>#{i + 1}</span> {s.label}
-                  </span>
-                  <button onClick={() => removeStop(i)}
-                    style={{ background: "none", border: "none", color: C.danger, cursor: "pointer", fontSize: 14, lineHeight: 1 }}>
-                    ×
-                  </button>
-                </div>
-              ))}
-            </div>
-            {stops.length > 0 && (
-              <button onClick={() => setStops([])}
-                style={{ ...btnSmall, marginTop: 6, background: "rgba(248,81,73,0.1)", borderColor: C.danger, color: C.danger, width: "100%" }}>
-                Clear all stops
-              </button>
-            )}
-          </section>
-
-          {/* CSV format hint */}
-          <div style={{
-            background: "rgba(139,148,158,0.06)", border: `1px solid ${C.border}`,
-            borderRadius: 5, padding: "7px 10px", fontSize: 10, color: C.muted
-          }}>
-            CSV format: <span style={{ color: C.text }}>lat,lon,label</span> (one stop per row)
-          </div>
-
-          {/* Error */}
-          {error && (
-            <div style={{
-              background: "rgba(248,81,73,0.08)", border: `1px solid ${C.danger}`,
-              borderRadius: 6, padding: "8px 12px", color: C.danger, fontSize: 12
-            }}>
-              {error}
-            </div>
-          )}
-
-          {/* Compute */}
-          <button
-            onClick={handleCompute}
-            disabled={loading}
-            style={{
-              background: loading ? C.border : C.accent,
-              color: loading ? C.muted : C.bg,
-              border: "none", borderRadius: 7, padding: "11px 0",
-              fontFamily: fontStack, fontWeight: 700, fontSize: 13,
-              cursor: loading ? "not-allowed" : "pointer",
-              letterSpacing: "0.06em", transition: "background 0.2s",
-              width: "100%"
-            }}
-          >
-            {loading ? "⟳  Computing…" : "⚡ COMPUTE ROUTES"}
-          </button>
-
-          {/* Results */}
-          {result && (
-            <div style={{ display: "flex", flexDirection: "column", gap: 10, paddingBottom: 20 }}>
-              <div style={{
-                background: "rgba(63,185,80,0.06)", border: `1px solid ${C.accentDim}`,
-                borderRadius: 8, padding: 12
-              }}>
-                <div style={{ color: C.accent, fontWeight: 700, fontSize: 13, marginBottom: 8 }}>
-                  🌿 Carbon Saved vs Fastest
-                </div>
-                <div style={{ display: "flex", gap: 10, marginBottom: 8 }}>
-                  <StatCard label="CO₂ Saved" value={result.carbon_saved_kg} unit="kg" highlight />
-                  <StatCard label="Reduction" value={result.carbon_saved_pct} unit="%" highlight />
-                </div>
-              </div>
-
-              {/* Toggle */}
-              <div style={{
-                display: "flex", border: `1px solid ${C.border}`,
-                borderRadius: 7, overflow: "hidden"
-              }}>
-                {[["🌿 Carbon Route", false], ["⚡ Fastest Route", true]].map(([label, isFastest]) => (
-                  <button key={label}
-                    onClick={() => setShowFastest(isFastest)}
-                    style={{
-                      flex: 1, padding: "8px 4px", border: "none",
-                      background: showFastest === isFastest ? (isFastest ? C.warn : C.accent) : "transparent",
-                      color: showFastest === isFastest ? C.bg : C.muted,
-                      fontFamily: fontStack, fontSize: 11, fontWeight: 700, cursor: "pointer",
-                      transition: "background 0.15s"
-                    }}
-                  >{label}</button>
-                ))}
-              </div>
-
-              {/* Active route stats */}
-              {displayRoute && (
-                <div style={{
-                  background: "rgba(255,255,255,0.02)", border: `1px solid ${C.border}`,
-                  borderRadius: 8, padding: 12
-                }}>
-                  <div style={{ color: C.muted, fontSize: 11, marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.08em" }}>
-                    {showFastest ? "Fastest Route Stats" : "Carbon Route Stats"}
-                  </div>
-                  <div style={{ display: "flex", gap: 8 }}>
-                    <StatCard label="CO₂" value={displayRoute.stats.carbon_kg} unit="kg" />
-                    <StatCard label="Dist" value={displayRoute.stats.distance_km} unit="km" />
-                    <StatCard label="Time" value={displayRoute.stats.time_min} unit="min" />
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* ── Map ───────────────────────────────────────────────────────── */}
-      <div style={{ flex: 1, position: "relative" }}>
-        <MapContainer
-          center={center} zoom={11} minZoom={9} maxZoom={16}
-          style={{ height: "100%", width: "100%" }}
-          zoomControl={false}
-        >
-          <TileLayer
-            attribution="© OpenStreetMap contributors"
-            url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}
-"
+        {/* Animated bus */}
+        {animatingBus && (
+          <AnimatedBus
+            key={animatingBus.key}
+            coords={animatingBus.coords}
+            color={animatingBus.color}
           />
-          <ZoomControl position="topright" />
-          
-          <ClickHandler addingStops={addingStops} onAddStop={handleAddStop} />
+        )}
+      </MapContainer>
 
-          {/* School marker */}
-          {school && (
-            <Marker position={[school.lat, school.lon]} icon={schoolIcon}>
-              <Popup>🏫 School</Popup>
-            </Marker>
-          )}
-
-          {/* Stop markers */}
-          {stops.map((s, i) => (
-            <Marker key={i} position={[s.lat, s.lon]} icon={stopIcon(i + 1)}>
-              <Popup>{s.label}<br />{s.lat.toFixed(5)}, {s.lon.toFixed(5)}</Popup>
-            </Marker>
+      {/* Legend */}
+      {result && (
+        <div style={{
+          position: "absolute", bottom: 20, right: 20, zIndex: 999,
+          background: C.panel, border: `1px solid ${C.border}`,
+          borderRadius: 8, padding: "10px 14px", fontFamily: fontStack,
+          display: "flex", flexDirection: "column", gap: 6
+        }}>
+          {result.buses && result.buses.map((bus, i) => (
+            <LegendRow
+              key={bus.bus_id}
+              color={BUS_COLORS[i % BUS_COLORS.length]}
+              label={`Bus ${bus.bus_id}`}
+            />
           ))}
+        </div>
+      )}
 
-          {/* Route polylines */}
-          {result && result.fastest_route.coords.length > 0 && (
-            <Polyline
-              positions={result.fastest_route.coords.map(c => [c.lat, c.lon])}
-              pathOptions={{ color: "#d29922", weight: showFastest ? 4 : 2, opacity: showFastest ? 0.9 : 0.3, dashArray: "6 4" }}
-            />
-          )}
-          {result && result.carbon_route.coords.length > 0 && (
-            <Polyline
-              positions={result.carbon_route.coords.map(c => [c.lat, c.lon])}
-              pathOptions={{ color: "#3fb950", weight: showFastest ? 2 : 4, opacity: showFastest ? 0.3 : 0.9 }}
-            />
-          )}
-        </MapContainer>
+      {/* Adding stops hint */}
+      {addingStops && (
+        <div style={{
+          position: "absolute", top: 16, left: "50%", transform: "translateX(-50%)", zIndex: 999,
+          background: C.panel, border: `1px solid ${C.accent}`,
+          borderRadius: 20, padding: "8px 18px",
+          color: C.accent, fontFamily: fontStack, fontSize: 12, fontWeight: 700,
+          pointerEvents: "none"
+        }}>
+          📍 Click map to place student stops
+        </div>
+      )}
 
-        {/* Map legend */}
-        {result && (
-          <div style={{
-            position: "absolute", bottom: 20, right: 20, zIndex: 999,
-            background: C.panel, border: `1px solid ${C.border}`,
-            borderRadius: 8, padding: "10px 14px", fontFamily: fontStack,
-            display: "flex", flexDirection: "column", gap: 6
-          }}>
-            <LegendRow color={C.accent} label="Carbon-efficient route" />
-            <LegendRow color={C.warn}   label="Fastest route" dashed />
-          </div>
-        )}
-
-        {/* Adding stops hint overlay */}
-        {addingStops && (
-          <div style={{
-            position: "absolute", top: 16, left: "50%", transform: "translateX(-50%)", zIndex: 999,
-            background: C.panel, border: `1px solid ${C.accent}`,
-            borderRadius: 20, padding: "8px 18px",
-            color: C.accent, fontFamily: fontStack, fontSize: 12, fontWeight: 700,
-            pointerEvents: "none"
-          }}>
-            📍 Click map to place student stops
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-// ── Helpers ────────────────────────────────────────────────────────────────────
-const inputStyle = {
-  flex: 1, background: "rgba(255,255,255,0.05)", border: `1px solid #30363d`,
-  borderRadius: 6, padding: "7px 10px", color: "#e6edf3",
-  fontFamily: `'IBM Plex Mono', monospace`, fontSize: 12, outline: "none"
-};
-
-const btnSmall = {
-  background: "#21262d", border: "1px solid #30363d", borderRadius: 6,
-  color: "#e6edf3", fontFamily: `'IBM Plex Mono', monospace`,
-  fontSize: 11, padding: "7px 10px", cursor: "pointer", whiteSpace: "nowrap"
-};
-
-function Label({ children }) {
-  return (
-    <div style={{
-      color: "#8b949e", fontSize: 10, letterSpacing: "0.1em",
-      textTransform: "uppercase", marginBottom: 6, fontWeight: 700
-    }}>{children}</div>
-  );
-}
-
-function LegendRow({ color, label, dashed }) {
-  return (
-    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-      <div style={{
-        width: 28, height: 3,
-        background: dashed ? "none" : color,
-        borderTop: dashed ? `2px dashed ${color}` : "none",
-      }} />
-      <span style={{ color: "#8b949e", fontSize: 11 }}>{label}</span>
+      {/* Click route hint */}
+      {result && !animatingBus && (
+        <div style={{
+          position: "absolute", bottom: 20, left: "50%", transform: "translateX(-50%)", zIndex: 999,
+          background: C.panel, border: `1px solid ${C.border}`,
+          borderRadius: 20, padding: "8px 18px",
+          color: C.muted, fontFamily: fontStack, fontSize: 11,
+          pointerEvents: "none"
+        }}>
+          🚌 Click a route to animate it
+        </div>
+      )}
     </div>
   );
 }
