@@ -10,10 +10,10 @@ import math
 import itertools
 from pyproj import Transformer
 from sklearn.cluster import KMeans
-import urllib.request, json
-
+import urllib.request, json, ssl, certifi, time
 
 app = Flask(__name__)
+CORS(app)
 
 @app.after_request
 def add_cors_headers(response):
@@ -94,12 +94,13 @@ IDLE_EMISSION_KG_S = 0.001
 IDLE_TIME_S        = 30
 MAX_BUS_CAPACITY   = 54
 MAX_ROUTE_MIN      = 70
+TARGET_STOPS_PER_BUS = 20  # target max stops per bus for scaling
 
 ROAD_FUEL_FACTOR = {
-    "motorway":     0.88,
-    "trunk":        0.90,
-    "primary":      0.93,
-    "secondary":    0.96,
+    "motorway":     0.86,
+    "trunk":        0.89,
+    "primary":      0.92,
+    "secondary":    0.95,
     "tertiary":     1.00,
     "residential":  1.15,
     "unclassified": 1.12,
@@ -118,7 +119,6 @@ def carbon_cost_edge(u, v, edge_data, num_students, elev_u, elev_v):
     length_km = length_m / 1000.0
     co2 = BASE_EMISSION_RATE * length_km
     co2 *= ROAD_FUEL_FACTOR.get(road_type(edge_data), 1.10)
-
     geom = edge_data.get("geometry", None)
     if geom is not None and length_m > 0:
         elevs = sample_edge_elevation(geom)
@@ -131,7 +131,6 @@ def carbon_cost_edge(u, v, edge_data, num_students, elev_u, elev_v):
         grade_factor = 1.0 + max(-0.15, min(0.60, grade * 4.0))
     else:
         grade_factor = 1.0
-
     co2 *= grade_factor
     load_factor = (BUS_EMPTY_MASS_KG + num_students * STUDENT_MASS_KG) / BUS_EMPTY_MASS_KG
     co2 *= load_factor ** 0.15
@@ -174,7 +173,6 @@ def snap_to_walkable_intersection(lat, lon, min_degree=3, max_walk_m=800):
     start_node = nearest_node(lat, lon)
     if G_proj.degree(start_node) >= min_degree:
         return lat, lon
-
     visited = {start_node: 0.0}
     queue   = [(0.0, start_node)]
     while queue:
@@ -198,7 +196,7 @@ def snap_to_walkable_intersection(lat, lon, min_degree=3, max_walk_m=800):
             queue.append((new_dist, neighbor))
     return lat, lon
 
-# ── Greedy TSP with 2-opt (round trip: school → stops → school) ───────────────
+# ── Greedy TSP with 2-opt ─────────────────────────────────────────────────────
 def greedy_route(H, school_node, stop_nodes, weight_key):
     if not stop_nodes:
         return [school_node], 0.0
@@ -217,7 +215,6 @@ def greedy_route(H, school_node, stop_nodes, weight_key):
             cost_cache[(a, b)] = cost_cache[(b, a)] = math.inf
             path_cache[(a, b)] = path_cache[(b, a)] = []
 
-    # Nearest-neighbor from school
     unvisited = list(stop_nodes)
     order, current = [], school_node
     while unvisited:
@@ -228,7 +225,6 @@ def greedy_route(H, school_node, stop_nodes, weight_key):
         unvisited.remove(best)
         current = best
 
-    # 2-opt (round trip cost)
     def route_cost(ord):
         seq = [school_node] + ord + [school_node]
         return sum(cost_cache.get((seq[i], seq[i+1]), math.inf)
@@ -243,7 +239,6 @@ def greedy_route(H, school_node, stop_nodes, weight_key):
                 if route_cost(new_order) < route_cost(order):
                     order, improved = new_order, True
 
-    # Stitch full path (round trip)
     full_path, total_w = [], 0.0
     seq = [school_node] + order + [school_node]
     for i in range(len(seq)-1):
@@ -256,7 +251,7 @@ def greedy_route(H, school_node, stop_nodes, weight_key):
 
     return full_path, total_w
 
-# ── Path → coordinate list ────────────────────────────────────────────────────
+# ── Path → coords ─────────────────────────────────────────────────────────────
 def path_to_coords(path):
     coords = []
     for i in range(len(path) - 1):
@@ -292,27 +287,27 @@ def compute_path_stats(path, num_students):
         "time_min":    round(total_time / 60, 1),
     }
 
-# ── Geographic quadrant helper ────────────────────────────────────────────────
+# ── Clustering helpers ────────────────────────────────────────────────────────
+def kmeans_clustering(stop_coords, n_buses, seed=42):
+    coords_arr = np.array([[c[0], c[1]] for c in stop_coords])
+    km  = KMeans(n_clusters=n_buses, n_init=10, random_state=seed)
+    lbl = km.fit_predict(coords_arr)
+    c   = [[] for _ in range(n_buses)]
+    for idx, l in enumerate(lbl):
+        c[l].append(idx)
+    return [x for x in c if x]
+
 def quadrant_clusters(stop_coords, n_buses):
-    """
-    Split stops into n_buses geographically coherent clusters by
-    recursively dividing the bounding box. Stops in the same quadrant
-    of the map stay together — buses never criss-cross the county.
-    """
     lats = [c[0] for c in stop_coords]
     lons = [c[1] for c in stop_coords]
     lat_mid = (min(lats) + max(lats)) / 2
     lon_mid = (min(lons) + max(lons)) / 2
-
     buckets = {0: [], 1: [], 2: [], 3: []}
     for idx, (lat, lon) in enumerate(stop_coords):
         ns = 0 if lat >= lat_mid else 1
         ew = 0 if lon >= lon_mid else 1
         buckets[ns * 2 + ew].append(idx)
-
     clusters = [b for b in buckets.values() if b]
-
-    # Subdivide largest cluster until we have enough
     while len(clusters) < n_buses:
         largest_i = max(range(len(clusters)), key=lambda i: len(clusters[i]))
         largest   = clusters[largest_i]
@@ -325,45 +320,32 @@ def quadrant_clusters(stop_coords, n_buses):
         clusters.pop(largest_i)
         if a: clusters.append(a)
         if b: clusters.append(b)
-
-    # Merge smallest pair until we have the right count
     while len(clusters) > n_buses:
         clusters.sort(key=len)
         clusters = [clusters[0] + clusters[1]] + clusters[2:]
-
     return clusters
 
-# ── VRP solver ────────────────────────────────────────────────────────────────
-def evaluate_clustering(clustering, n_buses, school_node, stop_nodes,
-                         stop_coords, num_students, H, enforce_cap):
-    """
-    Evaluate one clustering. Returns (buses_list, total_carbon) or None if invalid.
-    """
+# ── VRP evaluator ─────────────────────────────────────────────────────────────
+def evaluate_clustering(clustering, school_node, stop_nodes,
+                        stop_coords, num_students, H, enforce_cap):
     n_stops = len(stop_nodes)
-    buses        = []
-    total_carbon = 0.0
-
+    buses, total_carbon = [], 0.0
     for cluster_idxs in clustering:
         cluster_stops   = [stop_nodes[i] for i in cluster_idxs]
         students_on_bus = min(
             math.ceil(num_students * len(cluster_idxs) / n_stops),
             MAX_BUS_CAPACITY
         )
-
         carbon_path, _ = greedy_route(H, school_node, cluster_stops, "carbon_weight")
         if not carbon_path:
             return None
         carbon_stats = compute_path_stats(carbon_path, students_on_bus)
-
         if enforce_cap and carbon_stats["time_min"] > MAX_ROUTE_MIN:
             return None
-
         time_path, _ = greedy_route(H, school_node, cluster_stops, "time_weight")
         time_stats   = compute_path_stats(time_path, students_on_bus)
-
         if enforce_cap and time_stats["time_min"] > MAX_ROUTE_MIN:
             return None
-
         total_carbon += carbon_stats["carbon_kg"]
         buses.append({
             "bus_id":        len(buses) + 1,
@@ -372,9 +354,7 @@ def evaluate_clustering(clustering, n_buses, school_node, stop_nodes,
             "carbon_route":  {"coords": path_to_coords(carbon_path), "stats": carbon_stats},
             "fastest_route": {"coords": path_to_coords(time_path),   "stats": time_stats},
         })
-
     return buses, total_carbon
-
 
 def build_result(buses, total_carbon):
     total_fastest = sum(b["fastest_route"]["stats"]["carbon_kg"] for b in buses)
@@ -388,56 +368,56 @@ def build_result(buses, total_carbon):
         "carbon_saved_pct": saved_pct,
     }
 
-
+# ── VRP solver ────────────────────────────────────────────────────────────────
 def solve_vrp(school_node, stop_nodes, stop_coords, num_students, H):
-    n_stops   = len(stop_nodes)
+    n_stops = len(stop_nodes)
     if n_stops == 0:
         return {"buses": [], "num_buses": 0, "total_carbon_kg": 0.0}
 
-    min_buses = math.ceil(num_students / MAX_BUS_CAPACITY)
-    max_buses = 10
+    # Scale minimum buses based on both student capacity AND stop density
+    min_buses_capacity = math.ceil(num_students / MAX_BUS_CAPACITY)
+    min_buses_density  = math.ceil(n_stops / TARGET_STOPS_PER_BUS)
+    min_buses = max(min_buses_capacity, min_buses_density)
+    max_buses = min(max(min_buses + 4, math.ceil(n_stops / 10)), n_stops)
+
+    print(f"VRP: {n_stops} stops, {num_students} students → trying {min_buses}–{max_buses} buses")
+
     best_result = None
     best_carbon = math.inf
 
     for n_buses in range(min_buses, max_buses + 1):
-        coords_arr = np.array([[c[0], c[1]] for c in stop_coords])
-
-        # Build candidate clusterings for this bus count
         candidates = []
 
         if n_buses == 1:
             candidates.append([list(range(n_stops))])
-            if n_stops >= n_buses:
-                for seed in [42, 7, 13]:
-                    if n_stops < n_buses:
-                        clustering = quadrant_clusters(stop_coords, n_buses)
-                    else:
-                        km = KMeans(n_clusters=n_buses, n_init=10, random_state=42)
-                        lbl = km.fit_predict(coords_arr)
-                        c = [[] for _ in range(n_buses)]
-                        for idx, l in enumerate(lbl): c[l].append(idx)
-                        clustering  = [x for x in c if x]
+        else:
+            for seed in [42, 7, 13, 99]:
+                c = kmeans_clustering(stop_coords, n_buses, seed=seed)
+                if len(c) == n_buses:
+                    candidates.append(c)
 
+            q = quadrant_clusters(stop_coords, n_buses)
+            if len(q) == n_buses:
+                candidates.append(q)
 
-                elevs      = np.array([NODE_ELEV.get(stop_nodes[i], 0) for i in range(n_stops)])
-                elev_norm  = (elevs - elevs.min()) / (elevs.max() - elevs.min() + 1e-9)
-                cr         = coords_arr[:, 0].max() - coords_arr[:, 0].min() + 1e-9
-                ce         = np.column_stack([coords_arr, elev_norm * 0.5 * cr])
-                km3        = KMeans(n_clusters=n_buses, n_init=10, random_state=42)
-                lbl3       = km3.fit_predict(ce)
-                c3         = [[] for _ in range(n_buses)]
-                for idx, l in enumerate(lbl3): c3[l].append(idx)
-                candidates.append([x for x in c3 if x])
+            coords_arr = np.array([[c[0], c[1]] for c in stop_coords])
+            elevs      = np.array([NODE_ELEV.get(stop_nodes[i], 0) for i in range(n_stops)])
+            elev_range = elevs.max() - elevs.min() + 1e-9
+            coord_range = coords_arr[:, 0].max() - coords_arr[:, 0].min() + 1e-9
+            elev_norm  = (elevs - elevs.min()) / elev_range * 0.5 * coord_range
+            ce         = np.column_stack([coords_arr, elev_norm])
+            km3        = KMeans(n_clusters=n_buses, n_init=10, random_state=42)
+            lbl3       = km3.fit_predict(ce)
+            c3         = [[] for _ in range(n_buses)]
+            for idx, l in enumerate(lbl3):
+                c3[l].append(idx)
+            c3 = [x for x in c3 if x]
+            if len(c3) == n_buses:
+                candidates.append(c3)
 
-        # Geographic quadrant split — always attempted regardless of stop count
-            candidates.append(quadrant_clusters(stop_coords, n_buses))
-    
-        # Evaluate all candidates, keep best carbon for this bus count
         for clustering in candidates:
-            if len(clustering) != n_buses:
-                continue
             result = evaluate_clustering(
-                clustering, n_buses, school_node, stop_nodes,
+                clustering, school_node, stop_nodes,
                 stop_coords, num_students, H, enforce_cap=True
             )
             if result is None:
@@ -447,41 +427,42 @@ def solve_vrp(school_node, stop_nodes, stop_coords, num_students, H):
                 best_carbon = total_carbon
                 best_result = build_result(buses, total_carbon)
 
-    # Fallback: relax time cap, keep adding buses until routes are reasonable
+        # Only stop early if routes are short AND stops per bus is reasonable
+        if best_result is not None:
+            worst_time = max(
+                max(b["carbon_route"]["stats"]["time_min"],
+                    b["fastest_route"]["stats"]["time_min"])
+                for b in best_result["buses"]
+            )
+            max_stops_on_bus = max(len(b["stop_indices"]) for b in best_result["buses"])
+            if worst_time <= MAX_ROUTE_MIN * 0.5 and max_stops_on_bus <= TARGET_STOPS_PER_BUS:
+                print(f"  Early stop at {n_buses} buses (worst={worst_time:.0f}min, max_stops={max_stops_on_bus})")
+                break
+
+    # Fallback: relax time cap
     if best_result is None:
-        print("Warning: 70-min cap could not be met, using best available")
+        print("Warning: time cap could not be met, relaxing constraint")
         best_carbon = math.inf
         for n_buses in range(min_buses, max_buses + 1):
-            coords_arr  = np.array([[c[0], c[1]] for c in stop_coords])
-            km          = KMeans(n_clusters=n_buses, n_init=10, random_state=42)
-            lbl         = km.fit_predict(coords_arr)
-            c           = [[] for _ in range(n_buses)]
-            for idx, l in enumerate(lbl): c[l].append(idx)
-            clustering  = [x for x in c if x]
-
-            if len(clustering) != n_buses:
+            c = kmeans_clustering(stop_coords, n_buses)
+            if len(c) != n_buses:
                 continue
             result = evaluate_clustering(
-                clustering, n_buses, school_node, stop_nodes,
+                c, school_node, stop_nodes,
                 stop_coords, num_students, H, enforce_cap=False
             )
             if result is None:
                 continue
             buses, total_carbon = result
-            worst = max(
-                max(b["carbon_route"]["stats"]["time_min"],
-                    b["fastest_route"]["stats"]["time_min"])
-                for b in buses
-            )
             if total_carbon < best_carbon:
                 best_carbon = total_carbon
                 best_result = build_result(buses, total_carbon)
-            if worst <= MAX_ROUTE_MIN:
-                break   # stop as soon as cap is satisfied
 
     return best_result
 
 # ── Geocoding ─────────────────────────────────────────────────────────────────
+ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+
 geolocator      = Nominatim(user_agent="bus_router", timeout=10)
 geocode_limited = RateLimiter(geolocator.geocode, min_delay_seconds=1)
 
@@ -490,6 +471,23 @@ def geocode_address(address):
     if loc:
         return loc.latitude, loc.longitude
     return None
+
+# ── County boundary ───────────────────────────────────────────────────────────
+print("Fetching county boundary...")
+_COUNTY_BOUNDARY = None
+try:
+    time.sleep(8)  # wait for Nominatim rate limiter to recover after graph load
+    url = "https://nominatim.openstreetmap.org/search?q=Avery+County%2C+North+Carolina%2C+USA&format=json&polygon_geojson=1&limit=1"
+    req = urllib.request.Request(url, headers={"User-Agent": "ecoroute_boundary_fetcher/1.0"})
+    ctx = ssl.create_default_context(cafile=certifi.where())
+    with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
+        raw = resp.read()
+        print(f"County boundary response: {len(raw)} bytes")
+        _COUNTY_BOUNDARY = json.loads(raw)
+    print(f"County boundary cached: {len(_COUNTY_BOUNDARY)} result(s)")
+except Exception as e:
+    print(f"County boundary fetch failed: {type(e).__name__}: {e}")
+    _COUNTY_BOUNDARY = None
 
 # ── Flask routes ──────────────────────────────────────────────────────────────
 
@@ -500,10 +498,10 @@ def get_nodes():
 @app.route("/topography")
 def get_topography():
     with rasterio.open(DEM_PATH) as src:
-        data  = src.read(1)
+        data   = src.read(1)
         stride = 5
-        dem   = data[::stride, ::stride]
-        x, y  = np.gradient(dem)
+        dem    = data[::stride, ::stride]
+        x, y   = np.gradient(dem)
         slope  = np.pi / 2.0 - np.arctan(np.sqrt(x*x + y*y))
         aspect = np.arctan2(-x, y)
         az, al = 315 * np.pi / 180, 45 * np.pi / 180
@@ -523,6 +521,12 @@ def geocode():
         return jsonify({"lat": result[0], "lon": result[1]})
     return jsonify({"error": "Address not found"}), 404
 
+@app.route("/county-boundary")
+def county_boundary():
+    if _COUNTY_BOUNDARY is None:
+        return jsonify({"type": "FeatureCollection", "features": []}), 200
+    return jsonify(_COUNTY_BOUNDARY)
+
 @app.route("/route", methods=["POST"])
 def compute_route():
     body         = request.get_json()
@@ -539,26 +543,6 @@ def compute_route():
     H      = build_carbon_graph(num_students)
     result = solve_vrp(school_node, stop_nodes, stop_coords, num_students, H)
     return jsonify(result)
-
-print("Fetching county boundary...")
-_COUNTY_BOUNDARY = None
-try:
-    import time
-    time.sleep(1)  # brief pause so OSM graph load doesn't collide with Nominatim
-    url = "https://nominatim.openstreetmap.org/search?q=Avery+County%2C+North+Carolina%2C+USA&format=json&polygon_geojson=1&limit=1"
-    req = urllib.request.Request(url, headers={"User-Agent": "ecoroute_bus_router_v1"})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        _COUNTY_BOUNDARY = json.loads(resp.read())
-    print("County boundary cached.")
-except Exception as e:
-    print(f"County boundary fetch failed at startup (non-fatal): {e}")
-    _COUNTY_BOUNDARY = None
-
-@app.route("/county-boundary")
-def county_boundary():
-    if _COUNTY_BOUNDARY is None:
-        return jsonify([]), 200   # return empty array, frontend handles it gracefully
-    return jsonify(_COUNTY_BOUNDARY)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=6001, debug=True)
